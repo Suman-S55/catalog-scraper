@@ -1,0 +1,11 @@
+.env
+.env.*
+bin/
+dist/
+build/
+coverage.out
+*.db
+*.db-shm
+*.db-wal
+data/*.json
+data/**/*.json
