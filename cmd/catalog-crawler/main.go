@@ -39,6 +39,7 @@ type scrapeOptions struct {
 	randomDelayMS int
 	debug         bool
 	resume        bool
+	skip          int
 }
 
 func main() {
@@ -113,7 +114,7 @@ func newScrapeStructuredDataCommand() *cobra.Command {
 	cmd.Flags().IntVar(&opts.randomDelayMS, "random-delay-ms", opts.randomDelayMS, "additional random delay between page requests")
 	cmd.Flags().BoolVar(&opts.debug, "debug", opts.debug, "enable Colly request debug logging")
 	cmd.Flags().BoolVar(&opts.resume, "resume", opts.resume, "skip pages already marked visited in SQLite")
-
+	cmd.Flags().IntVar(&opts.skip, "skip", 0, "number of initial pages to skip")
 	return cmd
 }
 
@@ -194,6 +195,13 @@ func runScrapeStructuredData(opts scrapeOptions) error {
 	defer store.Close()
 
 	if len(pageURLs) > 0 {
+		if opts.skip > 0 {
+			if opts.skip >= len(pageURLs) {
+				return fmt.Errorf("skip value %d is greater than or equal to total discovered URLs (%d)", opts.skip, len(pageURLs))
+			}
+			fmt.Printf("Skipping the first %d URL(s)\n", opts.skip)
+			pageURLs = pageURLs[opts.skip:]
+		}
 		if opts.limit > 0 && len(pageURLs) > opts.limit {
 			pageURLs = pageURLs[:opts.limit]
 		}
@@ -207,9 +215,12 @@ func runScrapeStructuredData(opts scrapeOptions) error {
 			}
 		}
 	} else {
-		pageURLs, err = store.PendingPageURLs(ctx, opts.limit)
+		pageURLs, err = store.PendingPageURLs(ctx, opts.limit, opts.skip)
 		if err != nil {
 			return err
+		}
+		if opts.skip > 0 {
+			fmt.Printf("Skipping the first %d URL(s)\n", opts.skip)
 		}
 	}
 

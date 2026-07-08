@@ -99,7 +99,13 @@ func FetchRobotsSitemaps(url string) ([]string, error) {
 		return nil, fmt.Errorf("fetch robots.txt: unexpected status %s", resp.Status)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	body, err := responseBody(resp)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+
+	data, err := io.ReadAll(body)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +115,7 @@ func FetchRobotsSitemaps(url string) ([]string, error) {
 
 func ParseRobotsSitemaps(robots string) []string {
 	var sitemaps []string
-
+	// robotse= strings.ReplaceAll(robots, "\r", "")
 	for _, line := range strings.Split(robots, "\n") {
 		key, value, found := strings.Cut(strings.TrimSpace(line), ":")
 		if !found || !strings.EqualFold(strings.TrimSpace(key), "sitemap") {
@@ -318,15 +324,26 @@ func get(url string, accept string) (*http.Response, error) {
 		return nil, err
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", accept)
-	req.Header.Set("Accept-Language", "en-IN,en;q=0.9")
-
+	req.Header.Set("Accept-Language", "en-GB,en;q=0.9,en-US;q=0.8")
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set("Cache-Control", "max-age=0")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("sec-ch-ua", `"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"`)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
 	return client.Do(req)
 }
 
 func responseBody(resp *http.Response) (io.ReadCloser, error) {
-	if strings.Contains(resp.Header.Get("Content-Type"), "gzip") ||
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Encoding")), "gzip") ||
+		strings.Contains(resp.Header.Get("Content-Type"), "gzip") ||
 		strings.HasSuffix(resp.Request.URL.Path, ".gz") {
 		return gzip.NewReader(resp.Body)
 	}
