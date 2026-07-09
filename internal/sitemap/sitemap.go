@@ -1,15 +1,19 @@
 package sitemap
 
 import (
+	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"math/rand"
-	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"catalog-crawler/internal/sitehttp"
 )
 
 const TargetRobotsURL = "https://www.zara.com/robots.txt"
@@ -20,6 +24,8 @@ type ResolverConfig struct {
 	MaxConcurrency int
 	MinDelay       time.Duration
 	MaxDelay       time.Duration
+	Context        context.Context
+	HTTPClient     sitehttp.Client
 }
 
 type Document struct {
@@ -89,28 +95,24 @@ func DefaultResolverConfig() ResolverConfig {
 }
 
 func FetchRobotsSitemaps(url string) ([]string, error) {
-	resp, err := get(url, "text/plain,*/*")
+	client := sitehttp.DefaultClient()
+	return FetchRobotsSitemapsWithClient(context.Background(), client, url)
+}
+
+func FetchRobotsSitemapsWithClient(ctx context.Context, client sitehttp.Client, url string) ([]string, error) {
+	resp, err := client.Do(ctx, sitehttp.Request{
+		URL:    url,
+		Accept: "text/plain,*/*",
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("fetch robots.txt: unexpected status %s", resp.Status)
 	}
 
-	body, err := responseBody(resp)
-	if err != nil {
-		return nil, err
-	}
-	defer body.Close()
-
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return nil, err
-	}
-
-	return ParseRobotsSitemaps(string(data)), nil
+	return ParseRobotsSitemaps(string(resp.Body)), nil
 }
 
 func ParseRobotsSitemaps(robots string) []string {
@@ -137,6 +139,12 @@ func ResolveSitemaps(startURLs []string) ResolveReport {
 func ResolveSitemapsWithConfig(startURLs []string, config ResolverConfig) ResolveReport {
 	started := time.Now()
 	config = normalizeResolverConfig(config)
+	if config.Context == nil {
+		config.Context = context.Background()
+	}
+	if config.HTTPClient == nil {
+		config.HTTPClient = sitehttp.DefaultClient()
+	}
 
 	var report ResolveReport
 	seen := make(map[string]bool)
@@ -232,7 +240,7 @@ func resolveOneSitemap(current queuedSitemap, config ResolverConfig, rng *rand.R
 	record.DelayMS = sleepWithJitter(config, rng).Milliseconds()
 
 	sitemapStarted := time.Now()
-	doc, err := FetchDocument(current.URL)
+	doc, err := FetchDocumentWithClient(config.Context, config.HTTPClient, current.URL)
 	record.DurationMS = time.Since(sitemapStarted).Milliseconds()
 	if err != nil {
 		record.Status = "failed"
@@ -293,60 +301,63 @@ func sleepWithJitter(config ResolverConfig, rng *rand.Rand) time.Duration {
 }
 
 func FetchDocument(url string) (Document, error) {
-	resp, err := get(url, "application/xml,text/xml,*/*")
+	client := sitehttp.DefaultClient()
+	return FetchDocumentWithClient(context.Background(), client, url)
+}
+
+func FetchDocumentWithClient(ctx context.Context, client sitehttp.Client, url string) (Document, error) {
+	resp, err := client.Do(ctx, sitehttp.Request{
+		URL:    url,
+		Accept: "application/xml,text/xml,*/*",
+	})
 	if err != nil {
 		return Document{}, err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return Document{}, fmt.Errorf("fetch sitemap %s: unexpected status %s", url, resp.Status)
 	}
 
-	body, err := responseBody(resp)
+	body, err := sitemapBody(url, resp)
 	if err != nil {
 		return Document{}, err
 	}
-	defer body.Close()
 
 	var doc Document
-	if err := xml.NewDecoder(body).Decode(&doc); err != nil {
+	if err := xml.NewDecoder(bytes.NewReader(body)).Decode(&doc); err != nil {
 		return Document{}, err
 	}
 
 	return doc, nil
 }
 
-func get(url string, accept string) (*http.Response, error) {
-	client := &http.Client{Timeout: 20 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func sitemapBody(rawURL string, resp *sitehttp.Response) ([]byte, error) {
+	if !shouldGunzipSitemap(rawURL, resp) {
+		return resp.Body, nil
+	}
+
+	reader, err := gzip.NewReader(bytes.NewReader(resp.Body))
 	if err != nil {
 		return nil, err
 	}
+	defer reader.Close()
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", accept)
-	req.Header.Set("Accept-Language", "en-GB,en;q=0.9,en-US;q=0.8")
-	req.Header.Set("Accept-Encoding", "gzip")
-	req.Header.Set("Cache-Control", "max-age=0")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("sec-ch-ua", `"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"`)
-	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	return client.Do(req)
+	return io.ReadAll(reader)
 }
 
-func responseBody(resp *http.Response) (io.ReadCloser, error) {
-	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Encoding")), "gzip") ||
-		strings.Contains(resp.Header.Get("Content-Type"), "gzip") ||
-		strings.HasSuffix(resp.Request.URL.Path, ".gz") {
-		return gzip.NewReader(resp.Body)
+func shouldGunzipSitemap(rawURL string, resp *sitehttp.Response) bool {
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Encoding")), "gzip") {
+		return false
 	}
 
-	return resp.Body, nil
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "gzip") {
+		return true
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return strings.HasSuffix(strings.ToLower(rawURL), ".gz")
+	}
+	return strings.HasSuffix(strings.ToLower(parsed.Path), ".gz")
 }

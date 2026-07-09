@@ -50,7 +50,7 @@ func TestStorePersistsSitemapPagesAndProducts(t *testing.T) {
 		t.Fatalf("expected 1 page, got %d", pageCount)
 	}
 
-	pending, err := store.PendingPageURLs(ctx, 10)
+	pending, err := store.PendingPageURLs(ctx, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestStorePersistsSitemapPagesAndProducts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pending, err = store.PendingPageURLs(ctx, 10)
+	pending, err = store.PendingPageURLs(ctx, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
