@@ -112,13 +112,23 @@ func savePages(ctx context.Context, queries *db.Queries, pages []sitemap.PageURL
 	return nil
 }
 
-func (s *Store) PendingPageURLs(ctx context.Context, limit int) ([]string, error) {
+func (s *Store) PendingPageURLs(ctx context.Context, limit int, offset int) ([]string, error) {
 	var pages []db.Page
 	var err error
 	if limit > 0 {
-		pages, err = s.Queries.ListPendingPages(ctx, int64(limit))
+		pages, err = s.Queries.ListPendingPages(ctx, db.ListPendingPagesParams{
+			LimitCount:  int64(limit),
+			OffsetCount: int64(offset),
+		})
 	} else {
 		pages, err = s.Queries.ListAllPendingPages(ctx)
+		if err == nil && offset > 0 {
+			if offset >= len(pages) {
+				pages = nil
+			} else {
+				pages = pages[offset:]
+			}
+		}
 	}
 	if err != nil {
 		return nil, err

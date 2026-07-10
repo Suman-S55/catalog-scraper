@@ -1,24 +1,37 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"catalog-crawler/internal/sitehttp"
 	"catalog-crawler/internal/sitemap"
 	"catalog-crawler/internal/storage"
 	"catalog-crawler/internal/structureddata"
 
-	"github.com/gocolly/colly/v2"
-	"github.com/gocolly/colly/v2/debug"
+	"github.com/PuerkitoBio/goquery"
 	"github.com/spf13/cobra"
 )
+
+type httpOptions struct {
+	mode         string
+	profile      string
+	timeout      time.Duration
+	debug        bool
+	forceHTTP1   bool
+	disableHTTP3 bool
+	noRedirects  bool
+}
 
 type resolveOptions struct {
 	robotsURL      string
@@ -27,6 +40,7 @@ type resolveOptions struct {
 	concurrency    int
 	minDelayMillis int
 	maxDelayMillis int
+	http           httpOptions
 }
 
 type scrapeOptions struct {
@@ -39,6 +53,8 @@ type scrapeOptions struct {
 	randomDelayMS int
 	debug         bool
 	resume        bool
+	skip          int
+	http          httpOptions
 }
 
 func main() {
@@ -67,6 +83,7 @@ func newResolveSitemapsCommand() *cobra.Command {
 		concurrency:    4,
 		minDelayMillis: 0,
 		maxDelayMillis: 0,
+		http:           defaultHTTPOptions(),
 	}
 
 	cmd := &cobra.Command{
@@ -83,6 +100,7 @@ func newResolveSitemapsCommand() *cobra.Command {
 	cmd.Flags().IntVar(&opts.concurrency, "concurrency", opts.concurrency, "maximum concurrent sitemap fetches")
 	cmd.Flags().IntVar(&opts.minDelayMillis, "min-delay-ms", opts.minDelayMillis, "minimum delay before each sitemap fetch")
 	cmd.Flags().IntVar(&opts.maxDelayMillis, "max-delay-ms", opts.maxDelayMillis, "maximum delay before each sitemap fetch")
+	addHTTPFlags(cmd, &opts.http)
 
 	return cmd
 }
@@ -94,6 +112,7 @@ func newScrapeStructuredDataCommand() *cobra.Command {
 		delayMillis:   500,
 		randomDelayMS: 500,
 		resume:        true,
+		http:          defaultHTTPOptions(),
 	}
 
 	cmd := &cobra.Command{
@@ -111,15 +130,22 @@ func newScrapeStructuredDataCommand() *cobra.Command {
 	cmd.Flags().IntVar(&opts.parallelism, "parallelism", opts.parallelism, "maximum concurrent page requests per domain")
 	cmd.Flags().IntVar(&opts.delayMillis, "delay-ms", opts.delayMillis, "delay between page requests")
 	cmd.Flags().IntVar(&opts.randomDelayMS, "random-delay-ms", opts.randomDelayMS, "additional random delay between page requests")
-	cmd.Flags().BoolVar(&opts.debug, "debug", opts.debug, "enable Colly request debug logging")
+	cmd.Flags().BoolVar(&opts.debug, "debug", opts.debug, "print page request debug logging")
 	cmd.Flags().BoolVar(&opts.resume, "resume", opts.resume, "skip pages already marked visited in SQLite")
-
+	cmd.Flags().IntVar(&opts.skip, "skip", 0, "number of initial pages to skip")
+	addHTTPFlags(cmd, &opts.http)
 	return cmd
 }
 
 func runResolveSitemaps(opts resolveOptions) error {
 	ctx := context.Background()
-	sitemaps, err := sitemap.FetchRobotsSitemaps(opts.robotsURL)
+	httpClient, err := newHTTPClient(opts.http)
+	if err != nil {
+		return err
+	}
+	defer httpClient.CloseIdleConnections()
+
+	sitemaps, err := sitemap.FetchRobotsSitemapsWithClient(ctx, httpClient, opts.robotsURL)
 	if err != nil {
 		return err
 	}
@@ -131,6 +157,8 @@ func runResolveSitemaps(opts resolveOptions) error {
 		MaxConcurrency: opts.concurrency,
 		MinDelay:       time.Duration(opts.minDelayMillis) * time.Millisecond,
 		MaxDelay:       time.Duration(opts.maxDelayMillis) * time.Millisecond,
+		Context:        ctx,
+		HTTPClient:     httpClient,
 	}
 
 	report := sitemap.ResolveSitemapsWithConfig(sitemaps, config)
@@ -194,6 +222,13 @@ func runScrapeStructuredData(opts scrapeOptions) error {
 	defer store.Close()
 
 	if len(pageURLs) > 0 {
+		if opts.skip > 0 {
+			if opts.skip >= len(pageURLs) {
+				return fmt.Errorf("skip value %d is greater than or equal to total discovered URLs (%d)", opts.skip, len(pageURLs))
+			}
+			fmt.Printf("Skipping the first %d URL(s)\n", opts.skip)
+			pageURLs = pageURLs[opts.skip:]
+		}
 		if opts.limit > 0 && len(pageURLs) > opts.limit {
 			pageURLs = pageURLs[:opts.limit]
 		}
@@ -207,9 +242,12 @@ func runScrapeStructuredData(opts scrapeOptions) error {
 			}
 		}
 	} else {
-		pageURLs, err = store.PendingPageURLs(ctx, opts.limit)
+		pageURLs, err = store.PendingPageURLs(ctx, opts.limit, opts.skip)
 		if err != nil {
 			return err
+		}
+		if opts.skip > 0 {
+			fmt.Printf("Skipping the first %d URL(s)\n", opts.skip)
 		}
 	}
 
@@ -222,103 +260,13 @@ func runScrapeStructuredData(opts scrapeOptions) error {
 		return err
 	}
 
-	var failures []scrapeFailure
-	pageTimings := make(map[string]time.Time)
-	var resultsMu sync.Mutex
-
-	collectorOptions := []colly.CollectorOption{
-		colly.Async(true),
-		colly.AllowedDomains(allowedDomains...),
-		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
-	}
-	if opts.debug {
-		collectorOptions = append(collectorOptions, colly.Debugger(&debug.LogDebugger{}))
-	}
-
-	collector := colly.NewCollector(collectorOptions...)
-	if err := collector.Limit(&colly.LimitRule{
-		DomainGlob:  "*",
-		Parallelism: opts.parallelism,
-		Delay:       time.Duration(opts.delayMillis) * time.Millisecond,
-		RandomDelay: time.Duration(opts.randomDelayMS) * time.Millisecond,
-	}); err != nil {
+	httpClient, err := newHTTPClient(opts.http)
+	if err != nil {
 		return err
 	}
+	defer httpClient.CloseIdleConnections()
 
-	collector.OnHTML(`script[type="application/ld+json"]`, func(element *colly.HTMLElement) {
-		var found []structureddata.ProductRecord
-		for _, product := range structureddata.ExtractProducts(element.Text) {
-			found = append(found, structureddata.ProductRecord{
-				URL:  element.Request.URL.String(),
-				Data: product,
-			})
-		}
-		if len(found) == 0 {
-			return
-		}
-		for _, product := range found {
-			if err := store.InsertStructuredProduct(ctx, product); err != nil {
-				resultsMu.Lock()
-				failures = append(failures, scrapeFailure{
-					URL:   product.URL,
-					Error: fmt.Sprintf("store structured product: %v", err),
-				})
-				resultsMu.Unlock()
-			}
-		}
-	})
-
-	collector.OnRequest(func(request *colly.Request) {
-		resultsMu.Lock()
-		pageTimings[request.URL.String()] = time.Now()
-		resultsMu.Unlock()
-	})
-
-	collector.OnResponse(func(response *colly.Response) {
-		resultsMu.Lock()
-		defer resultsMu.Unlock()
-
-		if err := store.MarkPageSuccess(ctx, response.Request.URL.String(), response.StatusCode, durationSince(pageTimings[response.Request.URL.String()])); err != nil {
-			failures = append(failures, scrapeFailure{
-				URL:   response.Request.URL.String(),
-				Error: fmt.Sprintf("mark page success: %v", err),
-			})
-		}
-	})
-
-	collector.OnError(func(response *colly.Response, err error) {
-		resultsMu.Lock()
-		defer resultsMu.Unlock()
-		if dbErr := store.MarkPageFailure(ctx, response.Request.URL.String(), response.StatusCode, durationSince(pageTimings[response.Request.URL.String()]), err.Error()); dbErr != nil {
-			failures = append(failures, scrapeFailure{
-				URL:   response.Request.URL.String(),
-				Error: fmt.Sprintf("mark page failure: %v", dbErr),
-			})
-		}
-		failures = append(failures, scrapeFailure{
-			URL:    response.Request.URL.String(),
-			Status: response.StatusCode,
-			Error:  err.Error(),
-		})
-	})
-
-	for _, pageURL := range pageURLs {
-		if err := collector.Visit(pageURL); err != nil {
-			resultsMu.Lock()
-			if dbErr := store.MarkPageFailure(ctx, pageURL, 0, 0, err.Error()); dbErr != nil {
-				failures = append(failures, scrapeFailure{
-					URL:   pageURL,
-					Error: fmt.Sprintf("mark page visit failure: %v", dbErr),
-				})
-			}
-			failures = append(failures, scrapeFailure{
-				URL:   pageURL,
-				Error: err.Error(),
-			})
-			resultsMu.Unlock()
-		}
-	}
-	collector.Wait()
+	failures := scrapeStructuredPages(ctx, httpClient, store, pageURLs, allowedDomains, opts)
 
 	productCount, err := store.Queries.CountStructuredProducts(ctx)
 	if err != nil {
@@ -335,10 +283,192 @@ func runScrapeStructuredData(opts scrapeOptions) error {
 	return nil
 }
 
+func defaultHTTPOptions() httpOptions {
+	return httpOptions{
+		mode:    sitehttp.ModeTLS,
+		profile: sitehttp.DefaultProfile,
+		timeout: 30 * time.Second,
+	}
+}
+
+func addHTTPFlags(cmd *cobra.Command, opts *httpOptions) {
+	cmd.Flags().StringVar(&opts.mode, "http-mode", opts.mode, "HTTP client mode: tls or stdlib")
+	cmd.Flags().StringVar(&opts.profile, "tls-profile", opts.profile, "tls-client browser profile to use when --http-mode=tls")
+	cmd.Flags().DurationVar(&opts.timeout, "http-timeout", opts.timeout, "maximum duration for a single HTTP request")
+	cmd.Flags().BoolVar(&opts.debug, "tls-debug", opts.debug, "enable tls-client debug logging")
+	cmd.Flags().BoolVar(&opts.forceHTTP1, "force-http1", opts.forceHTTP1, "force HTTP/1.1 when using tls-client")
+	cmd.Flags().BoolVar(&opts.disableHTTP3, "disable-http3", opts.disableHTTP3, "disable HTTP/3 when using tls-client")
+	cmd.Flags().BoolVar(&opts.noRedirects, "no-redirects", opts.noRedirects, "disable automatic HTTP redirects")
+}
+
+func newHTTPClient(opts httpOptions) (sitehttp.Client, error) {
+	return sitehttp.New(sitehttp.Config{
+		Mode:         opts.mode,
+		Profile:      opts.profile,
+		Timeout:      opts.timeout,
+		Debug:        opts.debug,
+		ForceHTTP1:   opts.forceHTTP1,
+		DisableHTTP3: opts.disableHTTP3,
+		NoRedirects:  opts.noRedirects,
+	})
+}
+
 type scrapeFailure struct {
 	URL    string `json:"url"`
 	Status int    `json:"status,omitempty"`
 	Error  string `json:"error"`
+}
+
+func scrapeStructuredPages(ctx context.Context, client sitehttp.Client, store *storage.Store, pageURLs []string, allowedDomains []string, opts scrapeOptions) []scrapeFailure {
+	jobs := make(chan string)
+	allowed := make(map[string]bool, len(allowedDomains))
+	for _, domain := range allowedDomains {
+		allowed[domain] = true
+	}
+
+	var failures []scrapeFailure
+	var failuresMu sync.Mutex
+	var logMu sync.Mutex
+	var completed atomic.Int64
+	total := len(pageURLs)
+	var wg sync.WaitGroup
+
+	addFailure := func(failure scrapeFailure) {
+		failuresMu.Lock()
+		failures = append(failures, failure)
+		failuresMu.Unlock()
+	}
+
+	for workerID := 0; workerID < opts.parallelism; workerID++ {
+		wg.Add(1)
+		rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+		go func() {
+			defer wg.Done()
+			for pageURL := range jobs {
+				if !isAllowedPageURL(pageURL, allowed) {
+					err := fmt.Errorf("URL outside allowed domains")
+					if dbErr := store.MarkPageFailure(ctx, pageURL, 0, 0, err.Error()); dbErr != nil {
+						addFailure(scrapeFailure{URL: pageURL, Error: fmt.Sprintf("mark page failure: %v", dbErr)})
+					}
+					addFailure(scrapeFailure{URL: pageURL, Error: err.Error()})
+					logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "skipped", 0, 0, pageURL, err)
+					continue
+				}
+
+				sleepBeforePageRequest(opts, rng)
+				started := time.Now()
+				resp, err := client.Do(ctx, sitehttp.Request{URL: pageURL})
+				durationMS := durationSince(started)
+				if err != nil {
+					if dbErr := store.MarkPageFailure(ctx, pageURL, 0, durationMS, err.Error()); dbErr != nil {
+						addFailure(scrapeFailure{URL: pageURL, Error: fmt.Sprintf("mark page failure: %v", dbErr)})
+					}
+					addFailure(scrapeFailure{URL: pageURL, Error: err.Error()})
+					logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "failed", 0, durationMS, pageURL, err)
+					continue
+				}
+
+				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+					err := fmt.Errorf("unexpected status %s", resp.Status)
+					if dbErr := store.MarkPageFailure(ctx, pageURL, resp.StatusCode, durationMS, err.Error()); dbErr != nil {
+						addFailure(scrapeFailure{URL: pageURL, Error: fmt.Sprintf("mark page failure: %v", dbErr)})
+					}
+					addFailure(scrapeFailure{URL: pageURL, Status: resp.StatusCode, Error: err.Error()})
+					logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "failed", resp.StatusCode, durationMS, pageURL, err)
+					continue
+				}
+
+				products, err := productRecordsFromHTML(pageURL, resp.Body)
+				if err != nil {
+					if dbErr := store.MarkPageFailure(ctx, pageURL, resp.StatusCode, durationMS, err.Error()); dbErr != nil {
+						addFailure(scrapeFailure{URL: pageURL, Error: fmt.Sprintf("mark page failure: %v", dbErr)})
+					}
+					addFailure(scrapeFailure{URL: pageURL, Status: resp.StatusCode, Error: err.Error()})
+					logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "failed", resp.StatusCode, durationMS, pageURL, err)
+					continue
+				}
+
+				for _, product := range products {
+					if err := store.InsertStructuredProduct(ctx, product); err != nil {
+						addFailure(scrapeFailure{
+							URL:   product.URL,
+							Error: fmt.Sprintf("store structured product: %v", err),
+						})
+					}
+				}
+
+				if err := store.MarkPageSuccess(ctx, pageURL, resp.StatusCode, durationMS); err != nil {
+					addFailure(scrapeFailure{
+						URL:   pageURL,
+						Error: fmt.Sprintf("mark page success: %v", err),
+					})
+					logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "failed", resp.StatusCode, durationMS, pageURL, err)
+					continue
+				}
+				logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "scraped", resp.StatusCode, durationMS, pageURL, nil)
+			}
+		}()
+	}
+
+	for _, pageURL := range pageURLs {
+		jobs <- pageURL
+	}
+	close(jobs)
+	wg.Wait()
+
+	return failures
+}
+
+func logScrapeStatus(enabled bool, mu *sync.Mutex, completed int64, total int, label string, statusCode int, durationMS int64, pageURL string, err error) {
+	if !enabled {
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if err != nil {
+		fmt.Printf("[%s]\t[%d/%d]\t%d\t%dms\t%s\t%s\n", label, completed, total, statusCode, durationMS, pageURL, err)
+		return
+	}
+	fmt.Printf("[%s]\t[%d/%d]\t%d\t%dms\t%s\n", label, completed, total, statusCode, durationMS, pageURL)
+}
+
+func productRecordsFromHTML(pageURL string, body []byte) ([]structureddata.ProductRecord, error) {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	var products []structureddata.ProductRecord
+	doc.Find(`script[type="application/ld+json"]`).Each(func(_ int, selection *goquery.Selection) {
+		for _, product := range structureddata.ExtractProducts(selection.Text()) {
+			products = append(products, structureddata.ProductRecord{
+				URL:  pageURL,
+				Data: product,
+			})
+		}
+	})
+
+	return products, nil
+}
+
+func isAllowedPageURL(pageURL string, allowedDomains map[string]bool) bool {
+	parsed, err := url.Parse(pageURL)
+	if err != nil {
+		return false
+	}
+	return allowedDomains[parsed.Hostname()]
+}
+
+func sleepBeforePageRequest(opts scrapeOptions, rng *rand.Rand) {
+	delay := time.Duration(opts.delayMillis) * time.Millisecond
+	if opts.randomDelayMS > 0 {
+		delay += time.Duration(rng.Intn(opts.randomDelayMS+1)) * time.Millisecond
+	}
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 }
 
 func durationSince(started time.Time) int64 {
