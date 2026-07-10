@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"catalog-crawler/internal/sitehttp"
@@ -328,6 +329,8 @@ func scrapeStructuredPages(ctx context.Context, client sitehttp.Client, store *s
 	var failures []scrapeFailure
 	var failuresMu sync.Mutex
 	var logMu sync.Mutex
+	var completed atomic.Int64
+	total := len(pageURLs)
 	var wg sync.WaitGroup
 
 	addFailure := func(failure scrapeFailure) {
@@ -348,7 +351,7 @@ func scrapeStructuredPages(ctx context.Context, client sitehttp.Client, store *s
 						addFailure(scrapeFailure{URL: pageURL, Error: fmt.Sprintf("mark page failure: %v", dbErr)})
 					}
 					addFailure(scrapeFailure{URL: pageURL, Error: err.Error()})
-					logScrapeStatus(opts.debug, &logMu, "skipped", 0, 0, pageURL, err)
+					logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "skipped", 0, 0, pageURL, err)
 					continue
 				}
 
@@ -361,7 +364,7 @@ func scrapeStructuredPages(ctx context.Context, client sitehttp.Client, store *s
 						addFailure(scrapeFailure{URL: pageURL, Error: fmt.Sprintf("mark page failure: %v", dbErr)})
 					}
 					addFailure(scrapeFailure{URL: pageURL, Error: err.Error()})
-					logScrapeStatus(opts.debug, &logMu, "failed", 0, durationMS, pageURL, err)
+					logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "failed", 0, durationMS, pageURL, err)
 					continue
 				}
 
@@ -371,7 +374,7 @@ func scrapeStructuredPages(ctx context.Context, client sitehttp.Client, store *s
 						addFailure(scrapeFailure{URL: pageURL, Error: fmt.Sprintf("mark page failure: %v", dbErr)})
 					}
 					addFailure(scrapeFailure{URL: pageURL, Status: resp.StatusCode, Error: err.Error()})
-					logScrapeStatus(opts.debug, &logMu, "failed", resp.StatusCode, durationMS, pageURL, err)
+					logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "failed", resp.StatusCode, durationMS, pageURL, err)
 					continue
 				}
 
@@ -381,7 +384,7 @@ func scrapeStructuredPages(ctx context.Context, client sitehttp.Client, store *s
 						addFailure(scrapeFailure{URL: pageURL, Error: fmt.Sprintf("mark page failure: %v", dbErr)})
 					}
 					addFailure(scrapeFailure{URL: pageURL, Status: resp.StatusCode, Error: err.Error()})
-					logScrapeStatus(opts.debug, &logMu, "failed", resp.StatusCode, durationMS, pageURL, err)
+					logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "failed", resp.StatusCode, durationMS, pageURL, err)
 					continue
 				}
 
@@ -391,7 +394,6 @@ func scrapeStructuredPages(ctx context.Context, client sitehttp.Client, store *s
 							URL:   product.URL,
 							Error: fmt.Sprintf("store structured product: %v", err),
 						})
-						logScrapeStatus(opts.debug, &logMu, "failed", resp.StatusCode, durationMS, product.URL, err)
 					}
 				}
 
@@ -400,10 +402,10 @@ func scrapeStructuredPages(ctx context.Context, client sitehttp.Client, store *s
 						URL:   pageURL,
 						Error: fmt.Sprintf("mark page success: %v", err),
 					})
-					logScrapeStatus(opts.debug, &logMu, "failed", resp.StatusCode, durationMS, pageURL, err)
+					logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "failed", resp.StatusCode, durationMS, pageURL, err)
 					continue
 				}
-				logScrapeStatus(opts.debug, &logMu, "scraped", resp.StatusCode, durationMS, pageURL, nil)
+				logScrapeStatus(opts.debug, &logMu, completed.Add(1), total, "scraped", resp.StatusCode, durationMS, pageURL, nil)
 			}
 		}()
 	}
@@ -417,7 +419,7 @@ func scrapeStructuredPages(ctx context.Context, client sitehttp.Client, store *s
 	return failures
 }
 
-func logScrapeStatus(enabled bool, mu *sync.Mutex, label string, statusCode int, durationMS int64, pageURL string, err error) {
+func logScrapeStatus(enabled bool, mu *sync.Mutex, completed int64, total int, label string, statusCode int, durationMS int64, pageURL string, err error) {
 	if !enabled {
 		return
 	}
@@ -426,10 +428,10 @@ func logScrapeStatus(enabled bool, mu *sync.Mutex, label string, statusCode int,
 	defer mu.Unlock()
 
 	if err != nil {
-		fmt.Printf("[%s]\t%d\t%dms\t%s\t%s\n", label, statusCode, durationMS, pageURL, err)
+		fmt.Printf("[%s]\t[%d/%d]\t%d\t%dms\t%s\t%s\n", label, completed, total, statusCode, durationMS, pageURL, err)
 		return
 	}
-	fmt.Printf("[%s]\t%d\t%dms\t%s\n", label, statusCode, durationMS, pageURL)
+	fmt.Printf("[%s]\t[%d/%d]\t%d\t%dms\t%s\n", label, completed, total, statusCode, durationMS, pageURL)
 }
 
 func productRecordsFromHTML(pageURL string, body []byte) ([]structureddata.ProductRecord, error) {

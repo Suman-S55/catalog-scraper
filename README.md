@@ -99,9 +99,9 @@ go run ./cmd/catalog-crawler scrape-structured-data \
 Use `--debug` only for small troubleshooting runs. It prints per-page status lines:
 
 ```text
-[scraped]  200  531ms  https://example.com/product
-[failed]   403  212ms  https://example.com/product  unexpected status 403 Forbidden
-[skipped]  0    0ms    https://example.com/product  URL outside allowed domains
+[scraped]  [1201/5634]  200  531ms  https://example.com/product
+[failed]   [1202/5634]  403  212ms  https://example.com/product  unexpected status 403 Forbidden
+[skipped]  [1203/5634]  0    0ms    https://example.com/product  URL outside allowed domains
 ```
 
 ### HTTP Client Options
